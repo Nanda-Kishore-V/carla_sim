@@ -1,0 +1,3 @@
+[submodule "AlgosForRobotics"]
+	path = AlgosForRobotics
+	url = git@github.com:Nanda-Kishore-V/AlgosForRobotics.git
