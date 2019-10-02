@@ -3,47 +3,79 @@
 """
 2D Controller Class to be used for the CARLA waypoint follower demo.
 """
-
 import cutils
 import numpy as np
 
+from matplotlib import pyplot as plt
+
+from NavigationLibrary.controllers.LongitudinalPID import LongitudinalPID
+
 class Controller2D(object):
-    def __init__(self, waypoints):
-        self.vars                   = cutils.CUtils()
-        self._lookahead_distance    = 2.0
-        self._current_x             = 0
-        self._current_y             = 0
-        self._current_yaw           = 0
-        self._current_speed         = 0
-        self._desired_speed         = 0
-        self._current_frame         = 0
-        self._current_timestamp     = 0
-        self._start_control_loop    = False
-        self._set_throttle          = 0
-        self._set_brake             = 0
-        self._set_steer             = 0
-        self._waypoints             = waypoints
-        self._conv_rad_to_steer     = 180.0 / 70.0 / np.pi
-        self._pi                    = np.pi
-        self._2pi                   = 2.0 * np.pi
+    def __init__(self, waypoints, controller_type="MPC"):
+        self.vars = cutils.CUtils()
+        self._lookahead_distance = 3.0
+        self._lookahead_time = 1.0
+        self._current_x = 0
+        self._current_y = 0
+        self._current_yaw = 0
+        self._current_speed = 0
+        self._desired_speed = 0
+        self._current_frame = 0
+        self._current_timestamp = 0
+        self._start_control_loop = False
+        self._set_throttle = 0
+        self._set_brake = 0
+        self._set_steer = 0
+        self._waypoints = waypoints
+        self._conv_rad_to_steer = 180.0 / 70.0 / np.pi
+
+        self.longitudinal_controller = LongitudinalPID(self._current_speed,
+                                                       Kp=1.0,
+                                                       Kd=0.1,
+                                                       Ki=0.1,
+                                                       integrator_max=10.0,
+                                                       integrator_min=-10.0)
+        if controller_type == "PurePursuit":
+            from NavigationLibrary.controllers.PurePursuit import PurePursuit
+            self.lateral_controller = PurePursuit(self._current_x, self._current_y,
+                                                  self._current_yaw, self._current_speed,
+                                                  K=1.5)
+        elif controller_type == "StanleyController":
+            from NavigationLibrary.controllers.StanleyController import StanleyController
+            self.lateral_controller = StanleyController(self._current_x, self._current_y,
+                                                        self._current_yaw, self._current_speed,
+                                                        K=1.0)
+
+        elif controller_type == "MPC":
+            from NavigationLibrary.controllers.MPC import MPC
+            Q = np.eye(4)
+            R = 0.01*np.eye(2)
+            Qf = 5*np.eye(4)
+            Rd = np.eye(2)
+            self.controller = MPC(x=self._current_x, y=self._current_y, yaw=self._current_yaw,
+                                  v=self._current_speed, delta=0,
+                                  L=2, Q=Q, R=R, Qf=Qf, Rd=Rd,
+                                  len_horizon=10)
+
+        self.controller_type = controller_type
 
     def update_values(self, x, y, yaw, speed, timestamp, frame):
-        self._current_x         = x
-        self._current_y         = y
-        self._current_yaw       = yaw
-        self._current_speed     = speed
+        self._current_x = x
+        self._current_y = y
+        self._current_yaw = yaw
+        self._current_speed = speed
         self._current_timestamp = timestamp
-        self._current_frame     = frame
+        self._current_frame = frame
         if self._current_frame:
             self._start_control_loop = True
 
     def get_lookahead_index(self, lookahead_distance):
-        min_idx       = 0
-        min_dist      = float("inf")
+        min_idx = 0
+        min_dist = float("inf")
         for i in range(len(self._waypoints)):
             dist = np.linalg.norm(np.array([
-                    self._waypoints[i][0] - self._current_x,
-                    self._waypoints[i][1] - self._current_y]))
+                self._waypoints[i][0] - self._current_x,
+                self._waypoints[i][1] - self._current_y]))
             if dist < min_dist:
                 min_dist = dist
                 min_idx = i
@@ -54,23 +86,37 @@ class Controller2D(object):
             if total_dist >= lookahead_distance:
                 break
             total_dist += np.linalg.norm(np.array([
-                    self._waypoints[i][0] - self._waypoints[i-1][0],
-                    self._waypoints[i][1] - self._waypoints[i-1][1]]))
+                self._waypoints[i][0] - self._waypoints[i-1][0],
+                self._waypoints[i][1] - self._waypoints[i-1][1]]))
             lookahead_idx = i
         return lookahead_idx
 
     def update_desired_speed(self):
-        min_idx       = 0
-        min_dist      = float("inf")
+        min_idx = 0
+        min_dist = float("inf")
         desired_speed = 0
         for i in range(len(self._waypoints)):
             dist = np.linalg.norm(np.array([
-                    self._waypoints[i][0] - self._current_x,
-                    self._waypoints[i][1] - self._current_y]))
+                self._waypoints[i][0] - self._current_x,
+                self._waypoints[i][1] - self._current_y]))
             if dist < min_dist:
                 min_dist = dist
                 min_idx = i
         self._desired_speed = self._waypoints[min_idx][2]
+
+    def smooth_yaw(self, yaws):
+        for i in range(len(yaws) - 1):
+            dyaw = yaws[i+1] - yaws[i]
+
+            while dyaw >= np.pi/2.0:
+                yaws[i+1] -= 2.0 * np.pi
+                dyaw = yaws[i+1] - yaws[i]
+
+            while dyaw <= -np.pi/2.0:
+                yaws[i+1] += 2.0 * np.pi
+                dyaw = yaws[i+1] - yaws[i]
+
+        return yaws
 
     def update_waypoints(self, new_waypoints):
         self._waypoints = new_waypoints
@@ -80,7 +126,7 @@ class Controller2D(object):
 
     def set_throttle(self, input_throttle):
         # Clamp the throttle command to valid bounds
-        throttle           = np.fmax(np.fmin(input_throttle, 1.0), 0.0)
+        throttle = np.fmax(np.fmin(input_throttle, 1.0), 0.0)
         self._set_throttle = throttle
 
     def set_steer(self, input_steer_in_rad):
@@ -88,117 +134,83 @@ class Controller2D(object):
         input_steer = self._conv_rad_to_steer * input_steer_in_rad
 
         # Clamp the steering command to valid bounds
-        steer           = np.fmax(np.fmin(input_steer, 1.0), -1.0)
+        steer = np.fmax(np.fmin(input_steer, 1.0), -1.0)
         self._set_steer = steer
 
     def set_brake(self, input_brake):
         # Clamp the steering command to valid bounds
-        brake           = np.fmax(np.fmin(input_brake, 1.0), 0.0)
+        brake = np.fmax(np.fmin(input_brake, 1.0), 0.0)
         self._set_brake = brake
 
     def update_controls(self):
         ######################################################
         # RETRIEVE SIMULATOR FEEDBACK
         ######################################################
-        x               = self._current_x
-        y               = self._current_y
-        yaw             = self._current_yaw
-        v               = self._current_speed
+        x = self._current_x
+        y = self._current_y
+        yaw = self._current_yaw
+        v = self._current_speed
         self.update_desired_speed()
-        v_desired       = self._desired_speed
-        t               = self._current_timestamp
-        waypoints       = self._waypoints
+        v_desired = self._desired_speed
+        t = self._current_timestamp
+        waypoints = self._waypoints
         throttle_output = 0
-        steer_output    = 0
-        brake_output    = 0
+        steer_output = 0
+        brake_output = 0
 
-        self.vars.create_var('kp', 0.50)
-        self.vars.create_var('ki', 0.30)
-        self.vars.create_var('integrator_min', 0.0)
-        self.vars.create_var('integrator_max', 10.0)
-        self.vars.create_var('kd', 0.13)
-        self.vars.create_var('kp_heading', 8.00)
-        self.vars.create_var('k_speed_crosstrack', 0.00)
-        self.vars.create_var('cross_track_deadband', 0.01)
-        self.vars.create_var('x_prev', 0.0)
-        self.vars.create_var('y_prev', 0.0)
-        self.vars.create_var('yaw_prev', 0.0)
-        self.vars.create_var('v_prev', 0.0)
         self.vars.create_var('t_prev', 0.0)
-        self.vars.create_var('v_error', 0.0)
-        self.vars.create_var('v_error_prev', 0.0)
-        self.vars.create_var('v_error_integral', 0.0)
 
         # Skip the first frame to store previous values properly
         if self._start_control_loop:
 
-            self.vars.v_error           = v_desired - v
-            self.vars.v_error_integral += self.vars.v_error * \
-                                          (t - self.vars.t_prev)
-            v_error_rate_of_change      = (self.vars.v_error - self.vars.v_error_prev) /\
-                                          (t - self.vars.t_prev)
+            dt = t - self.vars.t_prev
+            throttle_output = self.longitudinal_controller.get_throttle_input(
+                v, dt, v_desired)
 
-            # cap the integrator sum to a min/max
-            self.vars.v_error_integral = \
-                    np.fmax(np.fmin(self.vars.v_error_integral,
-                                    self.vars.integrator_max),
-                            self.vars.integrator_min)
+            if self.controller_type == "PurePursuit":
+                lookahead_distance = self._lookahead_distance + self._lookahead_time * v
+                lookahead_idx = self.get_lookahead_index(lookahead_distance)
+                target_wp = [self._waypoints[lookahead_idx]
+                             [0], self._waypoints[lookahead_idx][1]]
+                steer_output = self.lateral_controller.get_steer_input(x, y,
+                                                                       yaw, v,
+                                                                       target_wp)
 
-            throttle_output = self.vars.kp * self.vars.v_error +\
-                              self.vars.ki * self.vars.v_error_integral +\
-                              self.vars.kd * v_error_rate_of_change
+            if self.controller_type == "StanleyController":
+                wp = np.array(self._waypoints)
+                steer_output = self.lateral_controller.get_steer_input(x, y, yaw, v,
+                                                                       wp.T)
 
-            # Find cross track error (assume point with closest distance)
-            crosstrack_error = float("inf")
-            crosstrack_vector = np.array([float("inf"), float("inf")])
+            if self.controller_type == "MPC":
+                cyaw = [yaw]
+                cx = []
+                cy = []
+                speed_profile = []
+                for i in range(len(self._waypoints)-1):
+                    cyaw.append(np.arctan2(self._waypoints[i+1][1] - self._waypoints[i][1],
+                                          self._waypoints[i+1][0] - self._waypoints[i][0]))
+                    cx.append(self._waypoints[i][0])
+                    cy.append(self._waypoints[i][1])
+                    speed_profile.append(self._waypoints[i][2])
 
-            ce_idx = self.get_lookahead_index(self._lookahead_distance)
-            crosstrack_vector = np.array([waypoints[ce_idx][0] - \
-                                         x - self._lookahead_distance*np.cos(yaw),
-                                          waypoints[ce_idx][1] - \
-                                         y - self._lookahead_distance*np.sin(yaw)])
-            crosstrack_error = np.linalg.norm(crosstrack_vector)
+                cyaw.append(cyaw[-1])
+                cx.append(self._waypoints[-1][0])
+                cy.append(self._waypoints[-1][1])
+                speed_profile.append(self._waypoints[-1][2])
+                ck = [0.0] * len(self._waypoints)
 
-            # set deadband to reduce oscillations
-            if crosstrack_error < self.vars.cross_track_deadband:
-                crosstrack_error = 0.0
+                cyaw = self.smooth_yaw(cyaw)
+                del cyaw[0]
 
-            # Compute the sign of the crosstrack error
-            crosstrack_heading = np.arctan2(crosstrack_vector[1],
-                                            crosstrack_vector[0])
-            crosstrack_heading_error = crosstrack_heading - yaw
-            crosstrack_heading_error = \
-                    (crosstrack_heading_error + self._pi) % \
-                    self._2pi - self._pi
+                plt.figure(0)
+                plt.cla()
+                plt.plot(cx, cy, '-c')
 
-            crosstrack_sign = np.sign(crosstrack_heading_error)
-
-            # Compute heading relative to trajectory (heading error)
-            # First ensure that we are not at the last index. If we are,
-            # flip back to the first index (loop the waypoints)
-            if ce_idx < len(waypoints)-1:
-                vect_wp0_to_wp1 = np.array(
-                        [waypoints[ce_idx+1][0] - waypoints[ce_idx][0],
-                         waypoints[ce_idx+1][1] - waypoints[ce_idx][1]])
-                trajectory_heading = np.arctan2(vect_wp0_to_wp1[1],
-                                                vect_wp0_to_wp1[0])
-            else:
-                vect_wp0_to_wp1 = np.array(
-                        [waypoints[0][0] - waypoints[-1][0],
-                         waypoints[0][1] - waypoints[-1][1]])
-                trajectory_heading = np.arctan2(vect_wp0_to_wp1[1],
-                                                vect_wp0_to_wp1[0])
-
-            heading_error = trajectory_heading - yaw
-            heading_error = \
-                    (heading_error + self._pi) % self._2pi - self._pi
-
-            # Compute steering command based on error
-            steer_output = heading_error + \
-                    np.arctan(self.vars.kp_heading * \
-                              crosstrack_sign * \
-                              crosstrack_error / \
-                              (v + self.vars.k_speed_crosstrack))
+                acceleration, steer_output, xs, ys, vs, yaws = \
+                    self.controller.get_inputs(x, y, yaw,
+                                               v, np.stack((cx, cy, cyaw, ck)),
+                                               speed_profile,
+                                               0.1)
 
             ######################################################
             # SET CONTROLS OUTPUT
@@ -207,10 +219,4 @@ class Controller2D(object):
             self.set_steer(steer_output)        # in rad (-1.22 to 1.22)
             self.set_brake(brake_output)        # in percent (0 to 1)
 
-        self.vars.x_prev       = x
-        self.vars.y_prev       = y
-        self.vars.yaw_prev     = yaw
-        self.vars.v_prev       = v
-        self.vars.v_error_prev = self.vars.v_error
-        self.vars.t_prev       = t
-
+        self.vars.t_prev = t
